@@ -1,13 +1,12 @@
 """
 ==============================================
-📱 TELEGRAM SESSION API (v2)
+📱 TELEGRAM SESSION API (v3)
 ==============================================
-Handles:
-  1. Session EXTRACTION (admin adds accounts from phone)
-  2. Session ACTIVATION (show phone number to customer)
-  3. OTP READING (read incoming OTP for customer)
+Handles session extraction, activation, and OTP reading.
+Deploy on Render.com (FREE).
 
-Deploy on Render.com (FREE). Your TBC bot calls this API.
+FIXED: Uses a persistent event loop so Telethon
+clients survive between HTTP requests.
 ==============================================
 """
 
@@ -15,10 +14,9 @@ import os
 import re
 import asyncio
 import time
-import json
-import logging
 import hashlib
 import threading
+import logging
 from flask import Flask, request, jsonify
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -32,81 +30,76 @@ PORT = int(os.environ.get("PORT", 5000))
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Active session clients
-active_sessions = {}
+# ===== PERSISTENT EVENT LOOP =====
+# This loop stays alive across all requests.
+# Telethon clients need this to survive between
+# extract_start and extract_verify calls.
+_loop = asyncio.new_event_loop()
 
-# Pending login flows (admin extracting sessions)
+def _run_loop():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+
+_bg_thread = threading.Thread(target=_run_loop, daemon=True)
+_bg_thread.start()
+
+def run_async(coro, timeout=30):
+    """Run async code on the persistent loop."""
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result(timeout=timeout)
+
+# Storage
+active_sessions = {}
 pending_logins = {}
 
-def get_session_hash(session_str):
-    return hashlib.md5(session_str[:50].encode()).hexdigest()[:12]
-
-def run_async(coro):
-    """Helper to run async code in sync Flask context."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+def get_session_hash(s):
+    return hashlib.md5(s[:50].encode()).hexdigest()[:12]
 
 # =============================================
-# HEALTH CHECK
+# HEALTH
 # =============================================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "active_sessions": len(active_sessions),
-        "pending_logins": len(pending_logins)
+        "active": len(active_sessions),
+        "pending": len(pending_logins)
     })
 
 # =============================================
-# 1. EXTRACT SESSION — Step 1: Send Login Code
+# 1. EXTRACT START — Send Login Code
 # =============================================
 @app.route("/extract_start", methods=["POST"])
 def extract_start():
-    """
-    Admin sends phone number → we send Telegram login code to that phone.
-    
-    POST: {"phone": "+919876543210", "secret": "..."}
-    Returns: {"status": "ok", "phone_hash": "abc123", "login_id": "xyz789"}
-    """
     try:
         data = request.get_json()
         if not data or data.get("secret") != SECRET_KEY:
             return jsonify({"status": "error", "message": "Invalid secret"}), 403
-        
-        phone = data.get("phone", "").strip()
+
+        phone = data.get("phone", "").strip().replace(" ", "").replace("-", "")
         if not phone or len(phone) < 8:
-            return jsonify({"status": "error", "message": "Invalid phone number"}), 400
-        
-        # Clean phone number
-        phone = phone.replace(" ", "").replace("-", "")
+            return jsonify({"status": "error", "message": "Invalid phone"}), 400
         if not phone.startswith("+"):
             phone = "+" + phone
-        
+
         login_id = hashlib.md5(f"{phone}{time.time()}".encode()).hexdigest()[:12]
-        
-        async def do_send_code():
+
+        async def do_send():
             client = TelegramClient(StringSession(), API_ID, API_HASH)
             await client.connect()
-            
             result = await client.send_code_request(phone)
-            
-            return {
-                "client": client,
-                "phone": phone,
-                "phone_code_hash": result.phone_code_hash,
-                "created_at": time.time()
-            }
-        
-        result = run_async(do_send_code())
-        
-        # Store pending login
-        pending_logins[login_id] = result
-        
-        # Auto-cleanup after 5 minutes
+            return client, result.phone_code_hash
+
+        client, phone_code_hash = run_async(do_send())
+
+        pending_logins[login_id] = {
+            "client": client,
+            "phone": phone,
+            "phone_code_hash": phone_code_hash,
+            "created_at": time.time()
+        }
+
+        # Auto-cleanup after 5 min
         def cleanup():
             time.sleep(300)
             if login_id in pending_logins:
@@ -115,90 +108,74 @@ def extract_start():
                     run_async(cl.disconnect())
                 except: pass
                 del pending_logins[login_id]
-        
-        t = threading.Thread(target=cleanup, daemon=True)
-        t.start()
-        
-        return jsonify({
-            "status": "ok",
-            "login_id": login_id,
-            "message": f"Code sent to {phone}"
-        })
-    
+        threading.Thread(target=cleanup, daemon=True).start()
+
+        return jsonify({"status": "ok", "login_id": login_id, "message": f"Code sent to {phone}"})
+
     except Exception as e:
-        logging.error(f"Extract start error: {e}")
+        logging.error(f"extract_start error: {e}")
         msg = str(e)
         if "PHONE_NUMBER_INVALID" in msg:
-            return jsonify({"status": "error", "message": "Invalid phone number format"}), 400
+            return jsonify({"status": "error", "message": "Invalid phone number"}), 400
         if "FLOOD" in msg:
-            return jsonify({"status": "error", "message": "Too many attempts. Wait a few minutes."}), 429
+            return jsonify({"status": "error", "message": "Too many attempts. Wait."}), 429
         return jsonify({"status": "error", "message": msg}), 500
 
 # =============================================
-# 2. EXTRACT SESSION — Step 2: Verify Code
+# 2. EXTRACT VERIFY — Complete Login
 # =============================================
 @app.route("/extract_verify", methods=["POST"])
 def extract_verify():
-    """
-    Admin sends the OTP code → we complete login → return session string.
-    
-    POST: {"login_id": "xyz789", "code": "12345", "password": "4321", "secret": "..."}
-    Returns: {"status": "ok", "session": "1BVts...", "phone": "919876543210", "name": "User"}
-    """
     try:
         data = request.get_json()
         if not data or data.get("secret") != SECRET_KEY:
             return jsonify({"status": "error", "message": "Invalid secret"}), 403
-        
+
         login_id = data.get("login_id", "")
         code = str(data.get("code", "")).strip()
         password = data.get("password", "")
-        
+
         if login_id not in pending_logins:
             return jsonify({"status": "error", "message": "Login expired. Start again."}), 404
-        
-        if not code:
-            return jsonify({"status": "error", "message": "Code is required"}), 400
-        
+
         login_data = pending_logins[login_id]
         client = login_data["client"]
         phone = login_data["phone"]
         phone_code_hash = login_data["phone_code_hash"]
-        
+
         async def do_verify():
             try:
                 await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
             except Exception as e:
-                if "SESSION_PASSWORD_NEEDED" in str(e):
+                err = str(e)
+                if "SESSION_PASSWORD_NEEDED" in err:
                     if password:
                         await client.sign_in(password=password)
                     else:
-                        raise Exception("2FA_NEEDED")
+                        return "2FA_NEEDED"
                 else:
                     raise
-            
+
             me = await client.get_me()
             session_str = client.session.save()
-            
-            phone_num = me.phone or "Unknown"
-            name = me.first_name or "Unknown"
-            user_id = me.id
-            
             await client.disconnect()
-            
+
             return {
                 "session": session_str,
-                "phone": phone_num,
-                "name": name,
-                "user_id": user_id
+                "phone": me.phone or "Unknown",
+                "name": me.first_name or "Unknown",
+                "user_id": me.id
             }
-        
+
         result = run_async(do_verify())
-        
-        # Clean up pending login
+
+        # Cleanup
         if login_id in pending_logins:
             del pending_logins[login_id]
-        
+
+        if result == "2FA_NEEDED":
+            return jsonify({"status": "2fa", "message": "Send the 2FA password too."})
+
         return jsonify({
             "status": "ok",
             "session": result["session"],
@@ -206,51 +183,36 @@ def extract_verify():
             "name": result["name"],
             "user_id": result["user_id"]
         })
-    
+
     except Exception as e:
         msg = str(e)
-        logging.error(f"Extract verify error: {msg}")
-        if "2FA_NEEDED" in msg:
-            return jsonify({"status": "2fa", "message": "This account has 2FA. Send the password too."}), 200
+        logging.error(f"extract_verify error: {msg}")
         if "PHONE_CODE_INVALID" in msg:
-            return jsonify({"status": "error", "message": "Wrong code. Try again."}), 400
+            return jsonify({"status": "error", "message": "Wrong code."}), 400
         if "PHONE_CODE_EXPIRED" in msg:
             return jsonify({"status": "error", "message": "Code expired. Start again."}), 400
         return jsonify({"status": "error", "message": msg}), 500
 
 # =============================================
-# 3. ACTIVATE SESSION — Connect & Get Account Info
+# 3. ACTIVATE SESSION
 # =============================================
 @app.route("/activate", methods=["POST"])
 def activate_session():
-    """
-    Connect to Telegram using session string, return phone + name.
-    
-    POST: {"session": "1BVts...", "secret": "..."}
-    Returns: {"status": "ok", "phone": "918899257952", "name": "Pranjal", "session_hash": "abc123"}
-    """
     try:
         data = request.get_json()
         if not data or data.get("secret") != SECRET_KEY:
             return jsonify({"status": "error", "message": "Invalid secret"}), 403
-        
+
         session_str = data.get("session", "").strip()
         if not session_str or len(session_str) < 50:
             return jsonify({"status": "error", "message": "Invalid session"}), 400
-        
-        session_hash = get_session_hash(session_str)
-        
-        # Check if already active
-        if session_hash in active_sessions:
-            info = active_sessions[session_hash]
-            return jsonify({
-                "status": "ok",
-                "phone": info["phone"],
-                "name": info["name"],
-                "user_id": info["user_id"],
-                "session_hash": session_hash
-            })
-        
+
+        sh = get_session_hash(session_str)
+
+        if sh in active_sessions:
+            info = active_sessions[sh]
+            return jsonify({"status": "ok", "phone": info["phone"], "name": info["name"], "user_id": info["user_id"], "session_hash": sh})
+
         async def do_activate():
             client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
             await client.connect()
@@ -258,114 +220,74 @@ def activate_session():
                 await client.disconnect()
                 return None
             me = await client.get_me()
-            return {
-                "client": client,
-                "phone": me.phone or "Unknown",
-                "name": me.first_name or "Unknown",
-                "user_id": me.id,
-                "activated_at": time.time()
-            }
-        
+            return {"client": client, "phone": me.phone or "Unknown", "name": me.first_name or "Unknown", "user_id": me.id, "activated_at": time.time()}
+
         result = run_async(do_activate())
-        
         if not result:
-            return jsonify({"status": "error", "message": "Session expired or invalid"}), 400
-        
-        active_sessions[session_hash] = result
-        
-        # Auto-disconnect after 10 min
+            return jsonify({"status": "error", "message": "Session expired"}), 400
+
+        active_sessions[sh] = result
+
         def cleanup():
             time.sleep(600)
-            if session_hash in active_sessions:
-                try:
-                    cl = active_sessions[session_hash]["client"]
-                    run_async(cl.disconnect())
+            if sh in active_sessions:
+                try: run_async(active_sessions[sh]["client"].disconnect())
                 except: pass
-                del active_sessions[session_hash]
-        
-        t = threading.Thread(target=cleanup, daemon=True)
-        t.start()
-        
-        return jsonify({
-            "status": "ok",
-            "phone": result["phone"],
-            "name": result["name"],
-            "user_id": result["user_id"],
-            "session_hash": session_hash
-        })
-    
+                del active_sessions[sh]
+        threading.Thread(target=cleanup, daemon=True).start()
+
+        return jsonify({"status": "ok", "phone": result["phone"], "name": result["name"], "user_id": result["user_id"], "session_hash": sh})
+
     except Exception as e:
-        logging.error(f"Activate error: {e}")
+        logging.error(f"activate error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =============================================
-# 4. GET OTP — Read Messages from Active Session
+# 4. GET OTP
 # =============================================
 @app.route("/get_otp", methods=["POST"])
 def get_otp():
-    """
-    Read recent OTP codes from an active session.
-    
-    POST: {"session_hash": "abc123", "secret": "..."}
-    Returns: {"status": "ok", "otp": "89934", "phone": "918899257952"}
-    """
     try:
         data = request.get_json()
         if not data or data.get("secret") != SECRET_KEY:
             return jsonify({"status": "error", "message": "Invalid secret"}), 403
-        
-        session_hash = data.get("session_hash", "")
-        if session_hash not in active_sessions:
-            return jsonify({"status": "error", "message": "Session not active or expired"}), 404
-        
-        info = active_sessions[session_hash]
+
+        sh = data.get("session_hash", "")
+        if sh not in active_sessions:
+            return jsonify({"status": "error", "message": "Session not active"}), 404
+
+        info = active_sessions[sh]
         client = info["client"]
-        
+
         async def do_read():
-            otps_found = []
+            otps = []
             try:
-                # Read messages from all recent chats
-                async for dialog in client.iter_dialogs(limit=5):
+                async for dlg in client.iter_dialogs(limit=5):
                     try:
-                        msgs = await client.get_messages(dialog, limit=5)
+                        msgs = await client.get_messages(dlg, limit=5)
                         for m in msgs:
                             if m.text:
                                 codes = re.findall(r'\b(\d{4,6})\b', m.text)
-                                for code in codes:
-                                    msg_time = m.date.timestamp()
-                                    if time.time() - msg_time < 600:
-                                        otps_found.append({
-                                            "code": code,
-                                            "text": m.text[:100],
-                                            "time": int(msg_time)
-                                        })
+                                for c in codes:
+                                    if time.time() - m.date.timestamp() < 600:
+                                        otps.append({"code": c, "text": m.text[:100]})
                     except: pass
             except: pass
-            return otps_found
-        
+            return otps
+
         otps = run_async(do_read())
-        
+
         if otps:
-            return jsonify({
-                "status": "ok",
-                "otp": otps[-1]["code"],
-                "full_message": otps[-1]["text"],
-                "all_otps": [o["code"] for o in otps],
-                "phone": info["phone"]
-            })
+            return jsonify({"status": "ok", "otp": otps[-1]["code"], "full_message": otps[-1]["text"], "phone": info["phone"]})
         else:
-            return jsonify({
-                "status": "waiting",
-                "message": "No OTP found yet",
-                "phone": info["phone"]
-            })
-    
+            return jsonify({"status": "waiting", "message": "No OTP yet", "phone": info["phone"]})
+
     except Exception as e:
-        logging.error(f"OTP error: {e}")
+        logging.error(f"get_otp error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =============================================
-# 5. DISCONNECT SESSION
+# 5. DISCONNECT
 # =============================================
 @app.route("/disconnect", methods=["POST"])
 def disconnect_session():
@@ -373,18 +295,15 @@ def disconnect_session():
         data = request.get_json()
         if data.get("secret") != SECRET_KEY:
             return jsonify({"status": "error"}), 403
-        session_hash = data.get("session_hash", "")
-        if session_hash in active_sessions:
-            try:
-                cl = active_sessions[session_hash]["client"]
-                run_async(cl.disconnect())
+        sh = data.get("session_hash", "")
+        if sh in active_sessions:
+            try: run_async(active_sessions[sh]["client"].disconnect())
             except: pass
-            del active_sessions[session_hash]
+            del active_sessions[sh]
         return jsonify({"status": "ok"})
     except:
         return jsonify({"status": "error"}), 500
 
 if __name__ == "__main__":
-    print("🚀 Session API v2 starting...")
-    print(f"📡 Port: {PORT}")
+    print("🚀 Session API v3 starting...")
     app.run(host="0.0.0.0", port=PORT, debug=False)
