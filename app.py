@@ -239,7 +239,7 @@ def activate_session():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =============================================
-# 4. GET OTP
+# 4. GET OTP — Returns NEWEST code
 # =============================================
 @app.route("/get_otp", methods=["POST"])
 def get_otp():
@@ -259,25 +259,50 @@ def get_otp():
             client = TelegramClient(StringSession(ss), API_ID, API_HASH)
             await client.connect()
             otps = []
+            now = time.time()
+            
             try:
-                async for dlg in client.iter_dialogs(limit=5):
-                    try:
-                        msgs = await client.get_messages(dlg, limit=5)
-                        for m in msgs:
-                            if m.text:
+                # Priority 1: Check Telegram service messages (777000)
+                try:
+                    msgs = await client.get_messages(777000, limit=3)
+                    for m in msgs:
+                        if m and m.text and m.date:
+                            age = now - m.date.timestamp()
+                            if age < 300:  # Last 5 min
                                 codes = re.findall(r'\b(\d{4,6})\b', m.text)
                                 for c in codes:
-                                    if time.time() - m.date.timestamp() < 600:
-                                        otps.append({"code": c, "text": m.text[:100]})
+                                    otps.append({"code": c, "text": m.text[:100], "time": m.date.timestamp()})
+                except: pass
+                
+                # Priority 2: Check recent chats
+                if not otps:
+                    try:
+                        async for dlg in client.iter_dialogs(limit=8):
+                            try:
+                                msgs = await client.get_messages(dlg, limit=3)
+                                for m in msgs:
+                                    if m and m.text and m.date:
+                                        age = now - m.date.timestamp()
+                                        if age < 300:  # Last 5 min
+                                            codes = re.findall(r'\b(\d{4,6})\b', m.text)
+                                            for c in codes:
+                                                otps.append({"code": c, "text": m.text[:100], "time": m.date.timestamp()})
+                            except: pass
                     except: pass
+                    
             except: pass
             await client.disconnect()
+            
+            # Sort by time — newest first
+            otps.sort(key=lambda x: x["time"], reverse=True)
             return otps
 
         otps = run_async(do_read())
 
         if otps:
-            return jsonify({"status": "ok", "otp": otps[-1]["code"], "full_message": otps[-1]["text"], "phone": info["phone"]})
+            # Return the NEWEST code
+            newest = otps[0]
+            return jsonify({"status": "ok", "otp": newest["code"], "full_message": newest["text"], "phone": info["phone"]})
         else:
             return jsonify({"status": "waiting", "message": "No OTP yet", "phone": info["phone"]})
 
